@@ -105,23 +105,25 @@ def get_network(
 def save(
     path: Union[str, epath.Path],
     step: int,
-    params: Tuple[Any, ...],
+    params: Any,
     config: config_dict.ConfigDict,
     config_fname: str = 'config.json',
 ):
   """Saves a checkpoint."""
-  ckpt_path = epath.Path(path) / f'{step:012d}'
+  ckpt_path = epath.Path(path)
   logging.info('saving checkpoint to %s', ckpt_path.as_posix())
 
   if not ckpt_path.exists():
     ckpt_path.mkdir(parents=True)
 
+  # Save config using to_json_best_effort
+  config_path = ckpt_path / config_fname
+  config_path.write_text(config.to_json_best_effort())
+
+  # Save parameters
   orbax_checkpointer = ocp.PyTreeCheckpointer()
   save_args = orbax_utils.save_args_from_target(params)
   orbax_checkpointer.save(ckpt_path, params, force=True, save_args=save_args)
-
-  config_path = ckpt_path / config_fname
-  config_path.write_text(config.to_json())
 
 
 def load(

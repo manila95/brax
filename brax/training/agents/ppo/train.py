@@ -198,6 +198,7 @@ def train(
     wrap_env: bool = True,
     madrona_backend: bool = False,
     augment_pixels: bool = False,
+    freeze_except_last_layer: bool = False,
     # environment wrapper
     num_envs: int = 1,
     episode_length: Optional[int] = None,
@@ -252,6 +253,7 @@ def train(
       environment as is.
     madrona_backend: whether to use Madrona backend for training
     augment_pixels: whether to add image augmentation to pixel inputs
+    freeze_except_last_layer: whether to freeze all layers except the last one for fine-tuning
     num_envs: the number of parallel environments to use for rollouts
       NOTE: `num_envs` must be divisible by the total number of chips since each
         chip gets `num_envs // total_number_of_chips` environments to roll out
@@ -621,6 +623,69 @@ def train(
         params=training_state.params.replace(
             policy=restore_params[1], value=value_params
         ),
+    )
+
+  if freeze_except_last_layer:
+    def create_partition_specs(params):
+      # In Flax/Linen, MLP parameters follow a specific structure:
+      # Each dense layer is stored with the naming convention 'hidden_{i}'
+      # The last layer will have the highest index
+      
+      # Helper to determine if a parameter path is part of the last layer
+      def is_last_layer(path):
+        # Look for the parameter path containing 'hidden_' with the highest index
+        if len(path) >= 2 and isinstance(path[1], str) and path[1].startswith('hidden_'):
+          # Get all keys that start with 'hidden_' and find the max index
+          hidden_keys = [k for k in params.keys() if isinstance(k, str) and k.startswith('hidden_')]
+          if not hidden_keys:
+            return True  # If no hidden layers found, don't freeze anything
+          
+          # Find the last layer name (highest index)
+          indices = [int(k.split('_')[1]) for k in hidden_keys]
+          max_index = max(indices)
+          last_layer = f'hidden_{max_index}'
+          
+          # Return True if this is the last layer
+          return path[1] == last_layer
+        return False
+      
+      # Create a partition tree with the same structure as params
+      # Mark parameters as 'trainable' or 'frozen'
+      return jax.tree_util.tree_map_with_path(
+          lambda path, _: 'trainable' if is_last_layer(path) else 'frozen', 
+          params
+      )
+    
+    # Create separate optimizers for trainable and frozen parameters
+    trainable_optimizer = optax.adam(learning_rate=learning_rate)
+    if max_grad_norm is not None:
+      trainable_optimizer = optax.chain(
+          optax.clip_by_global_norm(max_grad_norm),
+          optax.adam(learning_rate=learning_rate),
+      )
+    
+    param_specs = {
+        'trainable': trainable_optimizer,
+        'frozen': optax.set_to_zero()  # Zero out gradients for frozen parameters
+    }
+    
+    # Create partition specs for policy and value networks
+    policy_partition = create_partition_specs(training_state.params.policy)
+    value_partition = create_partition_specs(training_state.params.value)
+    partition = ppo_losses.PPONetworkParams(policy=policy_partition, value=value_partition)
+    
+    # Create multi-transform optimizer
+    optimizer = optax.multi_transform(param_specs, partition)
+    
+    # Initialize optimizer state with the new optimizer
+    optimizer_state = optimizer.init(training_state.params)
+    
+    # Update training state
+    training_state = training_state.replace(optimizer_state=optimizer_state)
+    
+    # Create a new gradient update function with the multi-transform optimizer
+    gradient_update_fn = gradients.gradient_update_fn(
+        loss_fn, optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
     )
 
   if num_timesteps == 0:
