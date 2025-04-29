@@ -60,7 +60,12 @@ class TrainingState:
 
 
 def _unpmap(v):
-  return jax.tree_util.tree_map(lambda x: x[0], v)
+  """Unpacks the first element of pmapped values, handling both arrays and scalars."""
+  def unpack(x):
+    if isinstance(x, (jnp.ndarray, np.ndarray)) and x.ndim > 0:
+      return x[0]
+    return x
+  return jax.tree_util.tree_map(unpack, v)
 
 
 def _strip_weak_type(tree):
@@ -190,10 +195,35 @@ def _remove_pixels(
   return {k: v for k, v in obs.items() if not k.startswith('pixels/')}
 
 
+def interpolate_params(params1, params2, lambda_value):
+  """Linearly interpolate between two parameter sets using lambda_value."""
+  # Verify parameter shapes match
+  def verify_shapes(x, y):
+    if isinstance(x, (jnp.ndarray, np.ndarray)) and isinstance(y, (jnp.ndarray, np.ndarray)):
+      if x.shape != y.shape:
+        raise ValueError(f"Shape mismatch: {x.shape} != {y.shape}")
+    return True
+  
+  # First verify all shapes match
+  jax.tree_util.tree_map(verify_shapes, params1, params2)
+  
+  # Then perform interpolation
+  return jax.tree_util.tree_map(
+      lambda x, y: (1 - lambda_value) * x + lambda_value * y, 
+      params1, 
+      params2
+  )
+
+
 def train(
     environment: envs.Env,
     num_timesteps: int,
     max_devices_per_host: Optional[int] = None,
+    # model merging parameters
+    model_path_1: Optional[str] = None,
+    model_path_2: Optional[str] = None,
+    lambda_value: float = 0.5,
+    evaluate_only: bool = False,
     # high-level control flow
     wrap_env: bool = True,
     madrona_backend: bool = False,
@@ -242,6 +272,7 @@ def train(
     restore_checkpoint_path: Optional[str] = None,
     restore_params: Optional[Any] = None,
     restore_value_fn: bool = True,
+    update_normalizer_params: bool = True,
 ):
   """PPO training.
 
@@ -523,11 +554,12 @@ def train(
       )
 
     # Update normalization params and normalize observations.
-    normalizer_params = running_statistics.update(
-        training_state.normalizer_params,
-        _remove_pixels(data.observation),
-        pmap_axis_name=_PMAP_AXIS_NAME,
-    )
+    if update_normalizer_params:
+      normalizer_params = running_statistics.update(
+          training_state.normalizer_params,
+          _remove_pixels(data.observation),
+          pmap_axis_name=_PMAP_AXIS_NAME,
+      )
 
     (optimizer_state, params, _), metrics = jax.lax.scan(
         functools.partial(
@@ -605,7 +637,42 @@ def train(
       env_steps=types.UInt64(hi=0, lo=0),
   )
 
-  if restore_checkpoint_path is not None:
+  # Handle model merging if both model paths are provided
+  if model_path_1 is not None and model_path_2 is not None:
+    try:
+      params1 = checkpoint.load(model_path_1)
+      params2 = checkpoint.load(model_path_2)
+      
+      # Log parameter shapes for debugging
+      # print("Model 1 parameter shapes:")
+      # jax.tree_util.tree_map(lambda x: print(f"{x.shape}"), params1)
+      # print("Model 2 parameter shapes:")
+      # jax.tree_util.tree_map(lambda x: print(f"{x.shape}"), params2)
+      
+      # Interpolate normalizer params
+      normalizer_params = interpolate_params(params1[0], params2[0], lambda_value)
+      
+      # Interpolate policy params
+      policy_params = interpolate_params(params1[1], params2[1], lambda_value)
+      
+      # Handle value function params based on restore_value_fn flag
+      if restore_value_fn:
+        value_params = interpolate_params(params1[2], params2[2], lambda_value)
+      else:
+        value_params = init_params.value
+      
+      training_state = training_state.replace(
+          normalizer_params=normalizer_params,
+          params=training_state.params.replace(
+              policy=policy_params,
+              value=value_params
+          ),
+      )
+    except Exception as e:
+      logging.error(f"Error during model merging: {str(e)}")
+      raise e
+  # Handle single model restore if specified
+  elif restore_checkpoint_path is not None:
     params = checkpoint.load(restore_checkpoint_path)
     value_params = params[2] if restore_value_fn else init_params.value
     training_state = training_state.replace(
@@ -688,21 +755,7 @@ def train(
         loss_fn, optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
     )
 
-  if num_timesteps == 0:
-    return (
-        make_policy,
-        (
-            training_state.normalizer_params,
-            training_state.params.policy,
-            training_state.params.value,
-        ),
-        {},
-    )
-
-  training_state = jax.device_put_replicated(
-      training_state, jax.local_devices()[:local_devices_to_use]
-  )
-
+  # Initialize evaluator for both training and evaluation modees
   eval_env = _maybe_wrap_env(
       eval_env or environment,
       wrap_env,
@@ -721,6 +774,40 @@ def train(
       episode_length=episode_length,
       action_repeat=action_repeat,
       key=eval_key,
+  )
+
+  # If evaluate_only is True, skip training and just run evaluation
+  if evaluate_only:
+    logging.info('Running evaluation only mode')
+    params = _unpmap((
+        training_state.normalizer_params,
+        training_state.params.policy,
+        training_state.params.value,
+    ))
+    
+    # Run evaluation
+    metrics = evaluator.run_evaluation(
+        params,
+        training_metrics={},
+    )
+    logging.info(metrics)
+    progress_fn(0, metrics)
+    
+    return make_policy, params, metrics
+
+  if num_timesteps == 0:
+    return (
+        make_policy,
+        (
+            training_state.normalizer_params,
+            training_state.params.policy,
+            training_state.params.value,
+        ),
+        {},
+    )
+
+  training_state = jax.device_put_replicated(
+      training_state, jax.local_devices()[:local_devices_to_use]
   )
 
   # Run initial eval
